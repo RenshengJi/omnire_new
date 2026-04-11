@@ -159,6 +159,13 @@ if __name__ == "__main__":
             "dynamic_masks",
             "objects"
         ],
+        help="Data components to preprocess. For nuPlan, per-frame timestamps used by NAVSIM export are saved together with pose.",
+    )
+    parser.add_argument(
+        "--undistort",
+        action="store_true",
+        default=False,
+        help="If set, undistort images and update intrinsics accordingly (removes black borders). Only used for nuplan dataset.",
     )
     args = parser.parse_args()
     if args.dataset != 'nuscenes' and args.interpolate_N > 0:
@@ -169,7 +176,7 @@ if __name__ == "__main__":
     elif args.split_file is not None:
         # parse the split file
         split_file = open(args.split_file, "r").readlines()[1:]
-        scene_ids_list = [line.strip().split(",")[0] for line in split_file]
+        scene_ids_list = [line.strip().split(",")[0] for line in split_file if line.strip()]
     else:
         scene_ids_list = np.arange(args.start_idx, args.start_idx + args.num_scenes)
 
@@ -233,7 +240,7 @@ if __name__ == "__main__":
         )
     elif args.dataset == "nuplan":
         from datasets.nuplan.nuplan_preprocess import NuPlanProcessor
-        
+
         dataset_processor = NuPlanProcessor(
             load_dir=args.data_root,
             save_dir=args.target_dir,
@@ -243,6 +250,7 @@ if __name__ == "__main__":
             process_keys=args.process_keys,
             process_id_list=scene_ids_list,
             workers=args.workers,
+            undistort=args.undistort,
         )
     else:
         raise ValueError(f"Unknown dataset {args.dataset}, please choose from waymo, pandaset, argoverse, nuscenes, kitti, nuplan")

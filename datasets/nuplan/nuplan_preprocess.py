@@ -1,7 +1,8 @@
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
+import cv2
 import numpy as np
 from PIL import Image
 from pyquaternion import Quaternion
@@ -63,6 +64,7 @@ class NuPlanProcessor(object):
         ],
         process_id_list=None,
         workers=64,
+        undistort=False,
     ):
         self.HW = (1080, 1920)
         print("Raw Image Resolution: ", self.HW)
@@ -72,6 +74,9 @@ class NuPlanProcessor(object):
         print("We will skip the first {} frames".format(self.start_frame_idx))
         self.max_frame_limit = max_frame_limit
         print("We will process the first {} frames each scene".format(self.max_frame_limit))
+        self.undistort = undistort
+        if self.undistort:
+            print("Undistortion is ENABLED: images will be undistorted and black borders will be cropped.")
         # the lidar data is collected at 20Hz, we need to downsample to 10Hz to match the camera data
         self.lidar_idxs = range(self.start_frame_idx, self.start_frame_idx + self.max_frame_limit * 2, 2)
         
@@ -96,10 +101,7 @@ class NuPlanProcessor(object):
             map_version='nuplan-maps-v1.0',
         )
         
-        process_log_list = []
-        for idx in process_id_list:
-            process_log_list.append(self.nuplandb_wrapper.log_names[idx])
-        self.process_log_list = process_log_list
+        self.process_log_list = process_id_list if process_id_list else self.nuplandb_wrapper.log_names
         
         self.save_dir = os.path.join(save_dir, prefix)
         self.workers = int(workers)
@@ -119,7 +121,15 @@ class NuPlanProcessor(object):
         """Convert action for single file."""
         # get log db
         log_db = self.nuplandb_wrapper.get_log_db(scene_log_name)
-        
+
+        # Clamp lidar_idxs to the actual number of lidar frames in this scene
+        total_lidar_frames = len(log_db.lidar_pc)
+        lidar_idxs_full = list(self.lidar_idxs)
+        lidar_idxs_full = [idx for idx in lidar_idxs_full if idx < total_lidar_frames]
+        if len(lidar_idxs_full) < len(list(self.lidar_idxs)):
+            actual_limit = len(lidar_idxs_full)
+            print(f"[{scene_log_name}] max_frame_limit exceeds scene length, clamped to {actual_limit} frames")
+
         # since lidar and images are captured at different frequency
         # we find the best start frame that lidar and images matches the best
         # lidar_idx:[0]   1   [2]   3   [4]   5   [6]
@@ -149,9 +159,9 @@ class NuPlanProcessor(object):
         shift_time_diff = [abs(lidar_timestamp - timestamp) for timestamp in images_timestamps]
         
         if sum(no_shift_time_diff) > sum(shift_time_diff):
-            lidar_idxs = [idx + 1 for idx in self.lidar_idxs]
+            lidar_idxs = [idx + 1 for idx in lidar_idxs_full if idx + 1 < total_lidar_frames]
         else:
-            lidar_idxs = self.lidar_idxs
+            lidar_idxs = lidar_idxs_full
         
         if "images" in self.process_keys:
             self.save_image(log_db, lidar_idxs)
@@ -164,6 +174,7 @@ class NuPlanProcessor(object):
             print(f"Processed lidar for {scene_log_name}")
         if "pose" in self.process_keys:
             self.save_pose(log_db, lidar_idxs)
+            self.save_timestamps(log_db, lidar_idxs)
             print(f"Processed pose for {scene_log_name}")
         if "dynamic_masks" in self.process_keys:
             self.save_dynamic_mask(log_db, lidar_idxs, valid_classes=NUPLAN_DYNAMIC_CLASSES, dir_name='all')
@@ -197,27 +208,49 @@ class NuPlanProcessor(object):
         return len(self.process_log_list)
 
     def save_image(self, log_db: NuPlanDB, lidar_idxs: List[int]):
-        """Parse and save the images in jpg format."""
+        """Parse and save the images in jpg format.
+
+        If self.undistort is True, images are undistorted and black borders are
+        cropped before saving. Otherwise, the raw JPEG is copied as-is.
+        """
         lidar_pcs = log_db.lidar_pc
+
+        # Pre-compute undistortion parameters once per camera (they are static)
+        undistort_params = {}  # channel -> (map1, map2, new_K, roi)
+        if self.undistort:
+            extrinsics, intrinsics, distortions = self.get_cameras_calib(log_db)
+            for channel in self.cam_list:
+                K = intrinsics[channel]
+                dist = distortions[channel]
+                map1, map2, new_K, roi = self.compute_undistort_params(K, dist, self.HW)
+                undistort_params[channel] = (map1, map2, new_K, roi)
+
         for frame_idx, lidar_idx in enumerate(lidar_idxs):
             if frame_idx >= self.max_frame_limit:
                 break
             lidar_pc = lidar_pcs[lidar_idx]
-            
+
             images = get_images_from_lidar_tokens(
                 log_file=os.path.join(self.split_dir, log_db.log_name + '.db'),
                 tokens=[lidar_pc.token],
                 channels=self.cam_list,
             )
-            
+
             image_cnt = 0
             for cam_id, image in enumerate(images):
                 raw_image_path = os.path.join(self.sensor_blobs_dir, image.filename_jpg)
                 image_save_path = f"{self.save_dir}/{log_db.log_name}/images/{str(frame_idx).zfill(3)}_{cam_id}.jpg"
-                
-                os.system(f"cp {raw_image_path} {image_save_path}")
-                image_cnt+=1
-                
+
+                if self.undistort:
+                    channel = self.cam_list[cam_id]
+                    map1, map2, new_K, roi = undistort_params[channel]
+                    img = cv2.imread(raw_image_path)  # BGR
+                    img_cropped = self.undistort_and_crop(img, map1, map2, roi)
+                    cv2.imwrite(image_save_path, img_cropped, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                else:
+                    os.system(f"cp {raw_image_path} {image_save_path}")
+                image_cnt += 1
+
             assert image_cnt == len(self.cam_list), \
                 f"Image number, camera number mismatch: {image_cnt} != {len(self.cam_list)}"
                 
@@ -227,29 +260,98 @@ class NuPlanProcessor(object):
         extrinsics, intrinsics, distortions = {}, {}, {}
         for cam in cameras:
             channel = cam.channel
-            
+
             extrinsic = Quaternion(cam.rotation).transformation_matrix
             extrinsic[:3, 3] = np.array(cam.translation)
             extrinsics[channel] = extrinsic
-            
+
             intrinsic = np.array(cam.intrinsic)
             intrinsics[channel] = intrinsic
-            
+
             distortions[channel] = np.array(cam.distortion)
-            
+
         return extrinsics, intrinsics, distortions
 
+    def compute_undistort_params(
+        self, K: np.ndarray, dist: np.ndarray, hw: Tuple[int, int]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
+        """Compute undistortion maps and new intrinsic matrix without black borders.
+
+        Uses cv2.getOptimalNewCameraMatrix with alpha=0 to compute the largest
+        all-valid (no black pixel) region, then returns the remap maps and the
+        crop ROI so that the final image has no black borders.
+
+        Args:
+            K: 3x3 camera intrinsic matrix.
+            dist: Distortion coefficients [k1, k2, p1, p2, k3].
+            hw: (height, width) of the original image.
+
+        Returns:
+            map1, map2: cv2 remap maps (for cv2.remap).
+            new_K: 3x3 new intrinsic matrix (after undistortion and crop).
+            roi: (x, y, w, h) crop region in the undistorted image (no black border).
+        """
+        h, w = hw
+        # alpha=0 → no black pixels in the output (crops as needed)
+        new_K, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0)
+        map1, map2 = cv2.initUndistortRectifyMap(K, dist, None, new_K, (w, h), cv2.CV_32FC1)
+        return map1, map2, new_K, roi
+
+    def undistort_and_crop(
+        self,
+        img_bgr: np.ndarray,
+        map1: np.ndarray,
+        map2: np.ndarray,
+        roi: Tuple[int, int, int, int],
+    ) -> np.ndarray:
+        """Apply remap and crop black borders from an image.
+
+        Args:
+            img_bgr: Input image (H, W, 3) in BGR or RGB — both are fine, remap is channel-agnostic.
+            map1, map2: Remap maps from compute_undistort_params.
+            roi: (x, y, w, h) crop region.
+
+        Returns:
+            Cropped undistorted image as numpy array.
+        """
+        undistorted = cv2.remap(img_bgr, map1, map2, interpolation=cv2.INTER_LINEAR)
+        x, y, w, h = roi
+        cropped = undistorted[y: y + h, x: x + w]
+        return cropped
+
     def save_calib(self, log_db: NuPlanDB, lidar_idxs: List[int]):
-        """Parse and save the calibration data."""
+        """Parse and save the calibration data.
+
+        When self.undistort is True, the saved intrinsics reflect the undistorted
+        (and cropped) image: fx/fy/cx/cy are updated from the optimal new camera
+        matrix, and all distortion coefficients are set to zero.
+        """
         extrinsics, intrinsics, distortions = self.get_cameras_calib(log_db)
         for channel in self.cam_list:
             cam_id = self.cam_list.index(channel)
-            
+
             intrinsic = intrinsics[channel]
-            fx, fy, cx, cy = intrinsic[0, 0], intrinsic[1, 1], intrinsic[0, 2], intrinsic[1, 2]
-            k1, k2, p1, p2, k3 = distortions[channel]
+
+            if self.undistort:
+                # Compute optimal new camera matrix (alpha=0 → no black pixels)
+                dist = distortions[channel]
+                h, w = self.HW
+                new_K, roi = cv2.getOptimalNewCameraMatrix(intrinsic, dist, (w, h), alpha=0)
+                # Adjust cx/cy for the crop offset so that the principal point is
+                # correct relative to the cropped image origin.
+                x_off, y_off, _, _ = roi
+                fx = new_K[0, 0]
+                fy = new_K[1, 1]
+                cx = new_K[0, 2] - x_off
+                cy = new_K[1, 2] - y_off
+                # Undistorted image has no distortion
+                k1, k2, p1, p2, k3 = 0.0, 0.0, 0.0, 0.0, 0.0
+            else:
+                fx, fy, cx, cy = intrinsic[0, 0], intrinsic[1, 1], intrinsic[0, 2], intrinsic[1, 2]
+                k1, k2, p1, p2, k3 = distortions[channel]
+
             Ks = np.array([fx, fy, cx, cy, k1, k2, p1, p2, k3])
-            
+
             np.savetxt(
                 f"{self.save_dir}/{log_db.log_name}/extrinsics/"
                 + f"{str(cam_id)}.txt",
@@ -270,7 +372,7 @@ class NuPlanProcessor(object):
                 break
             lidar_pc = lidar_pcs[lidar_idx]
             
-            lidar_data: LidarPointCloud = lidar_pc.load(log_db, lidar_idxs)
+            lidar_data: LidarPointCloud = lidar_pc.load(log_db)
             # version 1: a numpy array with 5 cols (x, y, z, intensity, ring).
             # version 2: a numpy array with 6 cols (x, y, z, intensity, ring, lidar_id).
             lidar_save_path = f"{self.save_dir}/{log_db.log_name}/lidar/{str(frame_idx).zfill(3)}.bin"
@@ -294,6 +396,31 @@ class NuPlanProcessor(object):
                 + f"{str(frame_idx).zfill(3)}.txt",
                 ego_pose
             )
+
+    def save_timestamps(self, log_db: NuPlanDB, lidar_idxs: List[int]):
+        """Save per-frame timestamp metadata for robust downstream clip matching."""
+        lidar_pcs = log_db.lidar_pc
+        frames = []
+        for frame_idx, lidar_idx in enumerate(lidar_idxs):
+            if frame_idx >= self.max_frame_limit:
+                break
+            lidar_pc = lidar_pcs[lidar_idx]
+            frames.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "lidar_idx": int(lidar_idx),
+                    "lidar_pc_token": str(lidar_pc.token),
+                    "timestamp": int(lidar_pc.timestamp),
+                    "timestamp_us": int(lidar_pc.timestamp),
+                }
+            )
+
+        payload = {
+            "log_name": log_db.log_name,
+            "frames": frames,
+        }
+        with open(f"{self.save_dir}/{log_db.log_name}/timestamps.json", "w") as fp:
+            json.dump(payload, fp, indent=2)
 
     def save_dynamic_mask(
         self, log_db: NuPlanDB, lidar_idxs: List[int],

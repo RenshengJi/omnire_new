@@ -97,17 +97,17 @@ pip install -e .
 ## 3. Process Raw Data
 You can provide a split file (e.g. `data/nuplan_example_scenes.txt`) to process a batch of scenes at once:
 ```shell
-# export PYTHONPATH=\path\to\project
+export PYTHONPATH=.
 python datasets/preprocess.py \
-    --data_root data/nuplan/raw \
-    --target_dir data/nuplan/processed \
+    --data_root /data2/ziqi.shi/nuplanmini_organized \
+    --target_dir /data2/ziqi.shi/nuplanmini_organized/processed \
     --dataset nuplan \
     --split mini \
     --split_file data/nuplan_example_scenes.txt \
     --workers 6 \
     --start_frame_idx 1000 \
-    --max_frame_limit 300 \
-    --process_keys images lidar pose calib dynamic_masks objects
+    --max_frame_limit 81 \
+    --process_keys images lidar pose calib objects
 ```
 The extracted data will be stored in the `data/nuplan/processed/mini` directory.
 
