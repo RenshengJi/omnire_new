@@ -108,6 +108,18 @@ python datasets/preprocess.py \
     --start_frame_idx 1000 \
     --max_frame_limit 81 \
     --process_keys images lidar pose calib objects
+
+export PYTHONPATH=.
+python datasets/preprocess.py \
+    --data_root /data/luefan/nuplan/raw \
+    --target_dir /data03/luefan/processed \
+    --dataset nuplan \
+    --split test \
+    --split_file data/nuplan_example_scenes.txt \
+    --workers 64 \
+    --start_frame_idx 1000 \
+    --max_frame_limit 10000 \
+    --process_keys images lidar pose calib objects
 ```
 The extracted data will be stored in the `data/nuplan/processed/mini` directory.
 

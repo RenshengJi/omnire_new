@@ -79,6 +79,10 @@ class NuPlanProcessor(object):
             print("Undistortion is ENABLED: images will be undistorted and black borders will be cropped.")
         # the lidar data is collected at 20Hz, we need to downsample to 10Hz to match the camera data
         self.lidar_idxs = range(self.start_frame_idx, self.start_frame_idx + self.max_frame_limit * 2, 2)
+        # Keep the tail boundary out of processing. Some logs have incomplete
+        # camera matches near the final lidar frames.
+        self.tail_lidar_margin = 20
+        self.camera_match_window_us = 100000
         
         # NUPLAN Provides 8 cameras
         self.cam_list = [    # {frame_idx}_{cam_id}.jpg
@@ -124,8 +128,9 @@ class NuPlanProcessor(object):
 
         # Clamp lidar_idxs to the actual number of lidar frames in this scene
         total_lidar_frames = len(log_db.lidar_pc)
+        effective_total_lidar_frames = max(self.start_frame_idx, total_lidar_frames - self.tail_lidar_margin)
         lidar_idxs_full = list(self.lidar_idxs)
-        lidar_idxs_full = [idx for idx in lidar_idxs_full if idx < total_lidar_frames]
+        lidar_idxs_full = [idx for idx in lidar_idxs_full if idx < effective_total_lidar_frames]
         if len(lidar_idxs_full) < len(list(self.lidar_idxs)):
             actual_limit = len(lidar_idxs_full)
             print(f"[{scene_log_name}] max_frame_limit exceeds scene length, clamped to {actual_limit} frames")
@@ -139,21 +144,13 @@ class NuPlanProcessor(object):
         # NOTE: the best match should be the frame with the closest timestamp to the lidar_pc (e.g. [0] [2] [4] [6])
         # calulate time shift of original start frame
         lidar_pc = log_db.lidar_pc[self.start_frame_idx]
-        images = get_images_from_lidar_tokens(
-            log_file=os.path.join(self.split_dir, log_db.log_name + '.db'),
-            tokens=[lidar_pc.token],
-            channels=self.cam_list,
-        )
+        images = self.get_closest_images(log_db, lidar_pc)
         images_timestamps = [image.timestamp for image in images]
         lidar_timestamp = lidar_pc.timestamp
         no_shift_time_diff = [abs(lidar_timestamp - timestamp) for timestamp in images_timestamps]
         # calulate time shift of original start frame + 1
         lidar_pc = log_db.lidar_pc[self.start_frame_idx + 1]
-        images = get_images_from_lidar_tokens(
-            log_file=os.path.join(self.split_dir, log_db.log_name + '.db'),
-            tokens=[lidar_pc.token],
-            channels=self.cam_list,
-        )
+        images = self.get_closest_images(log_db, lidar_pc)
         images_timestamps = [image.timestamp for image in images]
         lidar_timestamp = lidar_pc.timestamp
         shift_time_diff = [abs(lidar_timestamp - timestamp) for timestamp in images_timestamps]
@@ -230,11 +227,7 @@ class NuPlanProcessor(object):
                 break
             lidar_pc = lidar_pcs[lidar_idx]
 
-            images = get_images_from_lidar_tokens(
-                log_file=os.path.join(self.split_dir, log_db.log_name + '.db'),
-                tokens=[lidar_pc.token],
-                channels=self.cam_list,
-            )
+            images = self.get_closest_images(log_db, lidar_pc)
 
             image_cnt = 0
             for cam_id, image in enumerate(images):
@@ -253,6 +246,31 @@ class NuPlanProcessor(object):
 
             assert image_cnt == len(self.cam_list), \
                 f"Image number, camera number mismatch: {image_cnt} != {len(self.cam_list)}"
+
+    def get_closest_images(self, log_db: NuPlanDB, lidar_pc):
+        """Return one closest image per camera within the configured time window."""
+        images = get_images_from_lidar_tokens(
+            log_file=os.path.join(self.split_dir, log_db.log_name + '.db'),
+            tokens=[lidar_pc.token],
+            channels=self.cam_list,
+            lookahead_window_us=self.camera_match_window_us,
+            lookback_window_us=self.camera_match_window_us,
+        )
+
+        closest_images = {}
+        for image in images:
+            channel = image.channel
+            time_diff = abs(image.timestamp - lidar_pc.timestamp)
+            if channel not in closest_images or time_diff < closest_images[channel][0]:
+                closest_images[channel] = (time_diff, image)
+
+        missing_channels = [channel for channel in self.cam_list if channel not in closest_images]
+        assert len(missing_channels) == 0, (
+            f"Missing camera images within +/-{self.camera_match_window_us / 1000:.0f}ms "
+            f"for {log_db.log_name} lidar token {lidar_pc.token}: {missing_channels}"
+        )
+
+        return [closest_images[channel][1] for channel in self.cam_list]
                 
     def get_cameras_calib(self, log_db: NuPlanDB):
         """Get the camera calibration."""
@@ -578,11 +596,7 @@ class NuPlanProcessor(object):
                 token=lidar_pc.token
             )
             
-            images = get_images_from_lidar_tokens(
-                log_file=os.path.join(self.split_dir, log_db.log_name + '.db'),
-                tokens=[lidar_pc.token],
-                channels=self.cam_list,
-            )
+            images = self.get_closest_images(log_db, lidar_pc)
             
             for cam_id, image in enumerate(images):
                 raw_image_path = os.path.join(self.sensor_blobs_dir, image.filename_jpg)
