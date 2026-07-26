@@ -268,7 +268,7 @@ class CameraData(object):
             egocar_mask = Image.open(egocar_mask).convert("L")
             # resize them to the load_size
             egocar_mask = egocar_mask.resize(
-                (self.load_size[1], self.load_size[0]), Image.BILINEAR
+                (self.load_size[1], self.load_size[0]), Image.NEAREST
             )
             if self.undistort:
                 egocar_mask = cv2.undistort(
